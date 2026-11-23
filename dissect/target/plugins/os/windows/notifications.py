@@ -178,6 +178,15 @@ WpnDatabaseNotificationRecord = create_extended_descriptor([UserRecordDescriptor
         ("string", "group"),
         ("varint", "boot_id"),
         ("boolean", "expires_on_reboot"),
+        # Identity of the handler this notification was associated with, copied
+        # onto the notification itself so it stays traceable on its own.
+        ("string", "handler_primary_id"),
+        # Basis on which the handler association was made (e.g. "handler_id"),
+        # None when no handler could be associated.
+        ("string", "handler_match"),
+        # Delivery conclusion: "delivered", "expired" or "no_handler". The
+        # record itself only proves the notification exists in the database.
+        ("string", "status"),
     ],
 )
 
@@ -439,10 +448,25 @@ class NotificationsPlugin(Plugin):
     def wpndatabase(self) -> Iterator[WpnDatabaseNotificationRecord | WpnDatabaseNotificationHandlerRecord]:
         """Returns Windows Notifications from wpndatabase.db (post Windows 10 Anniversary).
 
+        Notifications are associated with their notification handler through the
+        handler's ``RecordId`` (referenced by the notification's ``HandlerId``),
+        never through the handler's ``PrimaryId``. The ``PrimaryId`` identifies
+        the application and is not guaranteed to be unique, so matching on it
+        could attribute a notification to the wrong handler. The matched
+        handler's ``PrimaryId`` and the association basis are copied onto each
+        notification record, so every notification remains traceable on its own,
+        including those whose handler is missing from the database.
+
+        Each notification also carries a ``status`` field with the delivery
+        conclusion: ``delivered``, ``expired`` (its expiry time has passed) or
+        ``no_handler`` (no handler record exists for it). The record itself only
+        proves the notification was present in the database.
+
         References:
             - https://inc0x0.com/2018/10/windows-10-notification-database/
         """
         target_tz = self.target.datetime.tzinfo
+        now = datetime.datetime.now(tz=target_tz)
 
         for user, wpndatabase in self.wpndb_files:
             with SQLite3(wpndatabase) as db:
@@ -450,14 +474,23 @@ class NotificationsPlugin(Plugin):
 
                 if table := db.table("NotificationHandler"):
                     for row in table.rows():
-                        handlers[row["[RecordId]"]] = WpnDatabaseNotificationHandlerRecord(
+                        record_id = row["[RecordId]"]
+                        if record_id in handlers:
+                            self.target.log.warning(
+                                "Duplicate NotificationHandler RecordId %s in %s, keeping the first entry.",
+                                record_id,
+                                wpndatabase,
+                            )
+                            continue
+
+                        handlers[record_id] = WpnDatabaseNotificationHandlerRecord(
                             created_time=datetime.datetime.strptime(row["[CreatedTime]"], "%Y-%m-%d %H:%M:%S").replace(
                                 tzinfo=target_tz
                             ),
                             modified_time=datetime.datetime.strptime(
                                 row["[ModifiedTime]"], "%Y-%m-%d %H:%M:%S"
                             ).replace(tzinfo=target_tz),
-                            id=row["[RecordId]"],
+                            id=record_id,
                             primary_id=row["[PrimaryId]"],
                             wns_id=row["[WNSId]"],
                             handler_type=row["[HandlerType]"],
@@ -467,11 +500,29 @@ class NotificationsPlugin(Plugin):
                             _user=user,
                         )
 
+                    primary_ids = [handler.primary_id for handler in handlers.values()]
+                    if len(primary_ids) != len(set(primary_ids)):
+                        self.target.log.warning(
+                            "Duplicate NotificationHandler PrimaryId values in %s, "
+                            "notifications are associated by HandlerId (RecordId) only.",
+                            wpndatabase,
+                        )
+
                 if table := db.table("Notification"):
                     for row in table.rows():
+                        handler = handlers.get(row["[HandlerId]"])
+                        expiry_time = wintimestamp(row["[ExpiryTime]"])
+
+                        if handler is None:
+                            status = "no_handler"
+                        elif expiry_time < now:
+                            status = "expired"
+                        else:
+                            status = "delivered"
+
                         record = WpnDatabaseNotificationRecord(
                             arrival_time=wintimestamp(row["[ArrivalTime]"]),
-                            expiry_time=wintimestamp(row["[ExpiryTime]"]),
+                            expiry_time=expiry_time,
                             order=row["[Order]"],
                             id=row["[Id]"],
                             handler_id=row["[HandlerId]"],
@@ -483,10 +534,12 @@ class NotificationsPlugin(Plugin):
                             group=row["[Group]"],
                             boot_id=row["[BootId]"],
                             expires_on_reboot=row["[ExpiresOnReboot]"] != "FALSE",
+                            handler_primary_id=handler.primary_id if handler else None,
+                            handler_match="handler_id" if handler else None,
+                            status=status,
                             _target=self.target,
                             _user=user,
                         )
-                        handler = handlers.get(row["[HandlerId]"])
 
                         if handler:
                             yield GroupedRecord("windows/notification/wpndatabase/grouped", [record, handler])

@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import sqlite3
+import uuid
 from collections import defaultdict
+from datetime import datetime as dt_datetime
+from datetime import timedelta, timezone
 from typing import TYPE_CHECKING
 
+from flow.record import GroupedRecord
 from flow.record.fieldtypes import datetime
 
 from dissect.target.helpers import fsutil
@@ -13,6 +18,8 @@ from dissect.target.plugins.os.windows.notifications import (
 from tests._utils import absolute_path
 
 if TYPE_CHECKING:
+    import pathlib
+
     from dissect.target.filesystem import VirtualFilesystem
     from dissect.target.target import Target
 
@@ -97,3 +104,139 @@ def test_notifications_wpndatabase(target_win_users: Target, fs_win: VirtualFile
     records = list(target_win_users.notifications.wpndatabase())
 
     assert len(records) == 3
+
+
+def _to_windows_timestamp(value: dt_datetime) -> int:
+    """Convert a datetime to a Windows timestamp (100ns intervals since 1601-01-01)."""
+    epoch = dt_datetime(1601, 1, 1, tzinfo=timezone.utc)
+    return int((value - epoch).total_seconds() * 10**7)
+
+
+def _create_wpndatabase(path: pathlib.Path) -> None:
+    """Create a minimal wpndatabase.db with edge cases for notification-handler association."""
+    now = dt_datetime.now(tz=timezone.utc)
+
+    with sqlite3.connect(path) as db:
+        db.execute(
+            "CREATE TABLE NotificationHandler ("
+            "[RecordId] INTEGER, [PrimaryId] TEXT, [WNSId] TEXT, [HandlerType] TEXT, "
+            "[WNFEventName] INTEGER, [SystemDataPropertySet] BLOB, [CreatedTime] TEXT, [ModifiedTime] TEXT)"
+        )
+        db.execute(
+            "CREATE TABLE Notification ("
+            "[Id] INTEGER, [HandlerId] INTEGER, [Order] INTEGER, [Type] TEXT, [Payload] BLOB, [PayloadType] TEXT, "
+            "[ArrivalTime] INTEGER, [ExpiryTime] INTEGER, [Tag] TEXT, [Group] TEXT, [ActivityId] BLOB, "
+            "[BootId] INTEGER, [ExpiresOnReboot] TEXT)"
+        )
+
+        # Two handlers share the same PrimaryId (duplicate application identifier).
+        handlers = [
+            (1, "App.Duplicate", "wns-1", "toast", 1, b"", "2023-01-01 00:00:00", "2023-01-01 00:00:00"),
+            (2, "App.Duplicate", "wns-2", "toast", 2, b"", "2023-01-02 00:00:00", "2023-01-02 00:00:00"),
+            (3, "App.Unique", "wns-3", "toast", 3, b"", "2023-01-03 00:00:00", "2023-01-03 00:00:00"),
+        ]
+        db.executemany("INSERT INTO NotificationHandler VALUES (?, ?, ?, ?, ?, ?, ?, ?)", handlers)
+
+        notifications = [
+            # Delivered notification for handler 2 (duplicate PrimaryId with handler 1).
+            (
+                1,
+                2,
+                1,
+                "toast",
+                b"<toast/>",
+                "xml",
+                _to_windows_timestamp(now),
+                _to_windows_timestamp(now + timedelta(days=1)),
+                "tag",
+                "group",
+                uuid.uuid4().bytes,
+                1,
+                "FALSE",
+            ),
+            # Expired notification for handler 1.
+            (
+                2,
+                1,
+                2,
+                "toast",
+                b"<toast/>",
+                "xml",
+                _to_windows_timestamp(now - timedelta(days=2)),
+                _to_windows_timestamp(now - timedelta(days=1)),
+                "tag",
+                "group",
+                uuid.uuid4().bytes,
+                1,
+                "FALSE",
+            ),
+            # Notification referencing a handler that is missing from the database.
+            (
+                3,
+                42,
+                3,
+                "toast",
+                b"<toast/>",
+                "xml",
+                _to_windows_timestamp(now),
+                _to_windows_timestamp(now + timedelta(days=1)),
+                "tag",
+                "group",
+                uuid.uuid4().bytes,
+                1,
+                "FALSE",
+            ),
+        ]
+        db.executemany("INSERT INTO Notification VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", notifications)
+
+
+def test_notifications_wpndatabase_traceability(
+    target_win_users: Target, fs_win: VirtualFilesystem, tmp_path: pathlib.Path
+) -> None:
+    """Notifications must stay traceable to their handler, even with duplicate app ids or missing handlers."""
+    test_file = tmp_path / "wpndatabase.db"
+    _create_wpndatabase(test_file)
+
+    wpndatabase_file = fsutil.join(USER_DIR, NOTIFICATIONS_DIR, "wpndatabase.db")
+    fs_win.map_file(wpndatabase_file, str(test_file))
+
+    target_win_users.add_plugin(NotificationsPlugin)
+
+    records = list(target_win_users.notifications.wpndatabase())
+    assert len(records) == 3
+
+    by_notification_id = {}
+    for record in records:
+        notification = record
+        if isinstance(record, GroupedRecord):
+            notification = record.get_record_by_type("windows/notification/wpndatabase")
+        by_notification_id[notification.id] = record
+
+    # Notification 1: associated with handler 2, not handler 1, despite both
+    # handlers sharing the same PrimaryId. The association is by HandlerId.
+    record = by_notification_id[1]
+    assert isinstance(record, GroupedRecord)
+    handler = record.get_record_by_type("windows/notification/wpndatabase/handler")
+    assert handler.id == 2
+    assert record.handler_id == 2
+    assert record.handler_primary_id == "App.Duplicate"
+    assert record.handler_match == "handler_id"
+    assert record.status == "delivered"
+
+    # Notification 2: expired, so the delivery conclusion differs from its
+    # mere presence in the database.
+    record = by_notification_id[2]
+    assert isinstance(record, GroupedRecord)
+    assert record.handler_primary_id == "App.Duplicate"
+    assert record.handler_match == "handler_id"
+    assert record.status == "expired"
+
+    # Notification 3: the handler is missing, so it is yielded on its own but
+    # remains independently traceable.
+    record = by_notification_id[3]
+    assert not isinstance(record, GroupedRecord)
+    assert record._desc.name == "windows/notification/wpndatabase"
+    assert record.handler_id == 42
+    assert record.handler_primary_id is None
+    assert record.handler_match is None
+    assert record.status == "no_handler"
