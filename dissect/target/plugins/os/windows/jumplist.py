@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+from dataclasses import dataclass
 from struct import error as StructError
 from typing import TYPE_CHECKING, BinaryIO
 
@@ -34,6 +35,7 @@ JumpListRecord = create_extended_descriptor([UserRecordDescriptorExtension])(
         ("string", "type"),
         ("string", "application_id"),
         ("string", "application_name"),
+        ("string", "source"),
         *LnkRecord.target_fields,
     ],
 )
@@ -66,6 +68,23 @@ c_custom_destination = cstruct()
 c_custom_destination.load(custom_destination_def)
 
 
+@dataclass
+class JumpListEntry:
+    """A single LNK entry parsed from a Jump List container.
+
+    Args:
+        lnk: The parsed LNK (shell link) data of the entry.
+        source: A locatable reference to the entry inside its container, so the
+            original entry can be traced back during forensic analysis. For
+            AutomaticDestination containers this is the name of the OLE
+            storage holding the LNK stream; for CustomDestination containers
+            this is the byte offset (hexadecimal) of the LNK GUID marker.
+    """
+
+    lnk: Lnk
+    source: str
+
+
 class JumpListFile:
     def __init__(self, fh: BinaryIO, file_name: str):
         self.fh = fh
@@ -75,7 +94,7 @@ class JumpListFile:
         self.application_type = self.application_type.split("-")[0]
         self.application_name = APPLICATION_IDENTIFIERS.get(self.application_id)
 
-    def __iter__(self) -> Iterator[Lnk]:
+    def __iter__(self) -> Iterator[JumpListEntry]:
         raise NotImplementedError
 
     @property
@@ -101,16 +120,16 @@ class AutomaticDestinationFile(JumpListFile):
         super().__init__(fh, file_name)
         self.ole = OLE(self.fh)
 
-    def __iter__(self) -> Iterator[Lnk]:
+    def __iter__(self) -> Iterator[JumpListEntry]:
         for dir_name in self.ole.root.listdir():
             if dir_name == "DestList":
                 continue
 
-            dir = self.ole.get(dir_name)
+            storage = self.ole.get(dir_name)
 
-            for item in dir.open():
+            for item in storage.open():
                 try:
-                    yield Lnk(io.BytesIO(item))
+                    yield JumpListEntry(lnk=Lnk(io.BytesIO(item)), source=dir_name)
                 except StructError:  # noqa: PERF203
                     continue
                 except Exception as e:
@@ -151,18 +170,21 @@ class CustomDestinationFile(JumpListFile):
         if self.magic != self.MAGIC_FOOTER:
             raise ValueError(f"The CustomDestination file has an invalid magic footer: {self.magic}")
 
-    def __iter__(self) -> Iterator[Lnk]:
+    def __iter__(self) -> Iterator[JumpListEntry]:
         # Searches for all LNK GUID's because the number of entries in the header is not always correct.
+        # Read from the start of the file so the reported offsets are absolute byte offsets into the
+        # container and can be used to locate the original entry again during forensic analysis.
+        self.fh.seek(0, io.SEEK_SET)
         buf = self.fh.read()
 
         for offset in findall(buf, LNK_GUID):
             try:
                 lnk = Lnk(io.BytesIO(buf[offset + len(LNK_GUID) :]))
-                yield lnk
+                yield JumpListEntry(lnk=lnk, source=hex(offset))
             except EOFError:  # noqa: PERF203
                 break
             except Exception as e:
-                log.warning("Failed to parse LNK file from a CustomDestination file")
+                log.warning("Failed to parse LNK file from a CustomDestination file at offset %s", hex(offset))
                 log.debug("", exc_info=e)
                 continue
 
@@ -213,6 +235,8 @@ class JumpListPlugin(Plugin):
             type (string): Type of Jump List.
             application_id (string): ID of the application.
             application_name (string): Name of the application.
+            source (string): Locatable reference of the entry inside the Jump List container,
+                the byte offset (hexadecimal) of the LNK GUID marker in the CustomDestination file.
             lnk_path (path): Path of the link (.lnk) file.
             lnk_name (string): Name of the link (.lnk) file.
             lnk_mtime (datetime): Modification time of the link (.lnk) file.
@@ -247,6 +271,8 @@ class JumpListPlugin(Plugin):
             type (string): Type of Jump List.
             application_id (string): ID of the application.
             application_name (string): Name of the application.
+            source (string): Locatable reference of the entry inside the Jump List container,
+                the name of the OLE storage holding the LNK stream in the AutomaticDestination file.
             lnk_path (path): Path of the link (.lnk) file.
             lnk_name (string): Name of the link (.lnk) file.
             lnk_mtime (datetime): Modification time of the link (.lnk) file.
@@ -271,7 +297,7 @@ class JumpListPlugin(Plugin):
     def _generate_records(
         self,
         destinations: list,
-        destination_file: AutomaticDestinationFile | CustomDestinationFile,
+        destination_file: type[AutomaticDestinationFile | CustomDestinationFile],
     ) -> Iterator[JumpListRecord]:
         for destination, user in destinations:
             fh = destination.open("rb")
@@ -285,13 +311,28 @@ class JumpListPlugin(Plugin):
                 self.target.log.debug("", exc_info=e)
                 continue
 
-            for lnk in jumplist:
-                if lnk := parse_lnk_file(self.target, lnk, destination):
-                    yield JumpListRecord(
-                        type=jumplist.type,
-                        application_name=jumplist.name,
-                        application_id=jumplist.id,
-                        **lnk._asdict(),
-                        _user=user,
-                        _target=self.target,
+            for entry in jumplist:
+                try:
+                    lnk = parse_lnk_file(self.target, entry.lnk, destination)
+                except Exception as e:
+                    self.target.log.warning(
+                        "Failed to parse Jump List entry %s from file: %s", entry.source, destination
                     )
+                    self.target.log.debug("", exc_info=e)
+                    continue
+
+                if lnk is None:
+                    self.target.log.warning(
+                        "Skipped Jump List entry %s without a link header from file: %s", entry.source, destination
+                    )
+                    continue
+
+                yield JumpListRecord(
+                    type=jumplist.type,
+                    application_name=jumplist.name,
+                    application_id=jumplist.id,
+                    source=entry.source,
+                    **lnk._asdict(),
+                    _user=user,
+                    _target=self.target,
+                )
